@@ -21,6 +21,7 @@
   sbx update                                     # обновить все подписки
   sbx ls                                         # серверы, ● — текущий
   sbx test                                       # задержка до всех серверов
+  sbx pick   (или sbx use без аргумента)         # меню: ↑↓, пробел — пинг, Enter — выбрать
   sbx use 5 | sbx use германия | sbx use auto    # выбрать сервер
   sbx up | down | restart | status | log -f
   sbx enable | disable                           # автозапуск при загрузке
@@ -47,6 +48,8 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+__version__ = "1.0.0"
 
 HOME = Path.home()
 CONF_DIR = HOME / ".config/sbx"
@@ -104,6 +107,7 @@ DEFAULT_STATE = {
         "test_url": "https://www.gstatic.com/generate_204",
         "ua": "SFA/1.13 (sbx; sing-box)",   # ^SFA — Remnawave/Marzban отдают sing-box JSON
         "log_level": "info",
+        "before_units": [],         # юниты, которые должны стартовать после VPN
     },
     "latency": {},          # tag -> ms (-1 = недоступен)
 }
@@ -767,6 +771,9 @@ def unit_text(st):
         for fam in ("-4", "-6"):
             rules.append(f"{fam} rule %s priority 8990 ipproto {proto} sport {port} lookup main")
     add = "\n".join(f"ExecStartPre=-+/usr/bin/ip {r % 'add'}" for r in rules)
+    units = st["settings"].get("before_units") or []
+    # сервисы, которым нужен VPN (боты и т.п.), стартуют уже после туннеля
+    before = f"Before={' '.join(units)}\n" if units else ""
     delete = "\n".join(f"ExecStopPost=-+/usr/bin/ip {r % 'del'}" for r in rules)
     return f"""# Сгенерировано sbx (~/scripts/sbx.py install). Правки затрёт следующий install.
 [Unit]
@@ -774,6 +781,9 @@ Description=sbx — sing-box VPN client
 Documentation=file://{Path(__file__).resolve()}
 After=network-online.target nss-lookup.target
 Wants=network-online.target
+{before}RequiresMountsFor={CONF_DIR} {WORK_DIR}
+# при загрузке не сдаваться после нескольких падений подряд
+StartLimitIntervalSec=0
 
 [Service]
 User={user}
@@ -992,55 +1002,243 @@ def cmd_use(st, a):
     print(f"✓ выбран {tag}")
 
 
+class Prober:
+    """Замер задержки через clash API: работающего sbx или временного sing-box без TUN.
+
+    Временный поднимается лениво, на первом замере: прав не нужно, мешать работающему нечему.
+    """
+
+    def __init__(self, st, timeout=5.0):
+        self.st, self.timeout = st, timeout
+        self.port, self.proc, self.tmpdir = None, None, None
+        self.url = urllib.parse.quote(st["settings"]["test_url"], safe="")
+
+    def ensure(self):
+        if self.port:
+            return
+        if is_active() and api_up(self.st):
+            self.port = self.st["settings"]["api_port"]
+            return
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="sbx-test-"))
+        port = free_port()
+        cfg = build_config(self.st, all_servers(self.st), tun=False, api_port=port,
+                           mixed_port=free_port())
+        (self.tmpdir / "c.json").write_text(json.dumps(cfg))
+        self.proc = subprocess.Popen(
+            [SING_BOX, "run", "-c", str(self.tmpdir / "c.json"), "-D", str(self.tmpdir)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(50):
+            if api_up(self.st, port):
+                self.port = port
+                return
+            time.sleep(0.1)
+        self.close()
+        raise RuntimeError("временный sing-box не поднялся")
+
+    def delay(self, tag):
+        """-> мс или -1."""
+        path = (f"/proxies/{urllib.parse.quote(tag, safe='')}/delay"
+                f"?url={self.url}&timeout={int(self.timeout * 1000)}")
+        try:
+            return api(self.st, "GET", path, port=self.port, timeout=self.timeout + 3)["delay"]
+        except (urllib.error.URLError, OSError, KeyError, ValueError):
+            return -1
+
+    def close(self):
+        if self.proc:
+            self.proc.terminate()
+            try:
+                self.proc.wait(5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+            self.proc = None
+        if self.tmpdir:
+            shutil.rmtree(self.tmpdir, ignore_errors=True)
+            self.tmpdir = None
+        self.port = None
+
+
 def cmd_test(st, a):
     servers = all_servers(st)
     if a.filter:
         servers = [s for s in servers if a.filter.lower() in s["tag"].lower()]
     if not servers:
         die("нечего проверять")
-    port, proc, tmpdir = None, None, None
-    if not (is_active() and api_up(st)):
-        # временный sing-box без TUN: прав не нужно, мешать работающему нечему
-        tmpdir = Path(tempfile.mkdtemp(prefix="sbx-test-"))
-        port = free_port()
-        cfg = build_config(st, all_servers(st), tun=False, api_port=port, mixed_port=free_port())
-        (tmpdir / "c.json").write_text(json.dumps(cfg))
-        proc = subprocess.Popen([SING_BOX, "run", "-c", str(tmpdir / "c.json"), "-D", str(tmpdir)],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        for _ in range(50):
-            if api_up(st, port):
-                break
-            time.sleep(0.1)
-        else:
-            proc.kill()
-            die("временный sing-box не поднялся")
-    url = urllib.parse.quote(st["settings"]["test_url"], safe="")
-    timeout = int(a.timeout * 1000)
-
-    def probe(s):
-        path = f"/proxies/{urllib.parse.quote(s['tag'], safe='')}/delay?url={url}&timeout={timeout}"
-        try:
-            return s["tag"], api(st, "GET", path, port=port, timeout=a.timeout + 3)["delay"]
-        except (urllib.error.URLError, OSError, KeyError, ValueError):
-            return s["tag"], -1
-
+    prober = Prober(st, a.timeout)
     try:
+        prober.ensure()
         with ThreadPoolExecutor(8) as ex:
-            results = dict(ex.map(probe, servers))
+            results = dict(zip((s["tag"] for s in servers),
+                               ex.map(prober.delay, (s["tag"] for s in servers))))
             # первая волна на холодную (DNS, TLS) даёт ложные отказы — упавшим второй шанс
-            retry = [s for s in servers if results[s["tag"]] < 0]
-            results.update(ex.map(probe, retry))
-        results = list(results.items())
+            retry = [t for t, ms in results.items() if ms < 0]
+            results.update(zip(retry, ex.map(prober.delay, retry)))
+    except RuntimeError as e:
+        die(str(e))
     finally:
-        if proc:
-            proc.terminate()
-            proc.wait(5)
-            shutil.rmtree(tmpdir, ignore_errors=True)
-    st["latency"].update(dict(results))
+        prober.close()
+    st["latency"].update(results)
     save_state(st)
     idx = {s["tag"]: i for i, s in enumerate(all_servers(st), 1)}
-    for tag, ms in sorted(results, key=lambda r: (r[1] < 0, r[1])):
+    for tag, ms in sorted(results.items(), key=lambda r: (r[1] < 0, r[1])):
         print(f"{idx[tag]:>4}  {tag:<34} {'недоступен' if ms < 0 else f'{ms} мс':>10}")
+
+
+def disp_width(text):
+    """Ширина в ячейках терминала: эмодзи и CJK занимают две."""
+    import unicodedata
+    w = 0
+    for ch in text:
+        if unicodedata.combining(ch) or ch in "\u200d\ufe0f":
+            continue
+        w += 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+    return w
+
+
+def fit(text, width):
+    """Обрезать/дополнить до ровно width ячеек."""
+    out, w = "", 0
+    for ch in text:
+        cw = disp_width(ch)
+        if w + cw > width:
+            break
+        out, w = out + ch, w + cw
+    return out + " " * (width - w)
+
+
+def cmd_pick(st, a):
+    """Интерактивный выбор: ↑↓ листать, пробел — пинг, a — пинг всех, Enter — выбрать."""
+    import curses
+    import threading
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        die("нужен терминал; без него: sbx use НОМЕР|ИМЯ|auto")
+    servers = all_servers(st)
+    if not servers:
+        die("серверов нет: sbx sub add ИМЯ URL")
+    items = [{"tag": "auto", "kind": "urltest", "source": ""}] + [
+        {"tag": s["tag"], "source": s["source"],
+         "kind": s["outbound"]["type"] + ("+reality" if (s["outbound"].get("tls") or {}).get("reality") else "")}
+        for s in servers]
+    rx = st["settings"].get("auto_exclude")
+    running = is_active() and api_up(st)
+    live = (current_node(st) or "").split(" → ")[-1] if running else None
+    lat = dict(st["latency"])
+    pending = set()
+    status = {"msg": ""}
+    prober = Prober(st)
+    pool = ThreadPoolExecutor(8)
+    lock = threading.Lock()
+
+    def ping(tags):
+        def job(tag):
+            try:
+                with lock:
+                    prober.ensure()
+            except RuntimeError as e:
+                status["msg"] = str(e)
+                pending.discard(tag)
+                return
+            ms = prober.delay(tag)
+            lat[tag] = ms
+            pending.discard(tag)
+        for tag in tags:
+            if tag not in pending:
+                pending.add(tag)
+                pool.submit(job, tag)
+
+    def ui(scr):
+        curses.curs_set(0)
+        scr.timeout(150)
+        scr.keypad(True)
+        curses.use_default_colors()
+        for i, c in enumerate((curses.COLOR_GREEN, curses.COLOR_YELLOW, curses.COLOR_RED,
+                               curses.COLOR_CYAN), 1):
+            curses.init_pair(i, c, -1)
+        sel = st["selected"] if st["selected"] in [it["tag"] for it in items] else "auto"
+        cur = next(i for i, it in enumerate(items) if it["tag"] == sel)
+        top = 0
+        while True:
+            h, w = scr.getmaxyx()
+            rows = max(1, h - 3)
+            cur = max(0, min(cur, len(items) - 1))
+            top = min(max(top, cur - rows + 1), cur)
+            scr.erase()
+            head = "Сервер VPN   ↑↓ PgUp PgDn — листать · пробел — пинг · a — все · Enter — выбрать · q — выход"
+            scr.addstr(0, 0, fit(head, w - 1), curses.A_BOLD)
+            name_w = max(10, min(40, w - 40))
+            for row, it in enumerate(items[top:top + rows]):
+                i = top + row
+                tag = it["tag"]
+                mark = "●" if tag == sel else ("›" if sel == "auto" and tag == live else " ")
+                num = "  0" if i == 0 else f"{i:>3}"
+                if tag in pending:
+                    lat_s, color = "   …   ", 4
+                elif tag in lat:
+                    ms = lat[tag]
+                    lat_s = " —  " if ms < 0 else f"{ms:>4} мс"
+                    color = 3 if ms < 0 else (1 if ms < 150 else 2 if ms < 400 else 3)
+                else:
+                    lat_s, color = "", 0
+                note = "  (не в auto)" if i and rx and re.search(rx, tag, re.I) else ""
+                line = f" {mark} {num}  {fit(tag, name_w)} {fit(it['kind'], 15)}"
+                attr = curses.A_REVERSE if i == cur else curses.A_NORMAL
+                try:
+                    scr.addstr(row + 1, 0, fit(line, w - 1), attr)
+                    x = disp_width(line) + 1
+                    if lat_s and x + 8 < w:
+                        scr.addstr(row + 1, x, fit(lat_s, 8), attr | curses.color_pair(color))
+                    if note and x + 9 + len(note) < w:
+                        scr.addstr(row + 1, x + 8, note, attr | curses.A_DIM)
+                except curses.error:
+                    pass
+            state = "работает" if running else "выключен — пинг через временный sing-box"
+            foot = f" VPN {state} · выбран: {sel}"
+            if pending:
+                foot += f" · проверяю {len(pending)}…"
+            if status["msg"]:
+                foot += f" · {status['msg']}"
+            try:
+                scr.addstr(h - 1, 0, fit(foot, w - 1), curses.A_DIM)
+            except curses.error:
+                pass
+            scr.refresh()
+
+            k = scr.getch()
+            if k in (curses.KEY_UP, ord("k")):
+                cur -= 1
+            elif k in (curses.KEY_DOWN, ord("j")):
+                cur += 1
+            elif k == curses.KEY_PPAGE:
+                cur -= rows
+            elif k == curses.KEY_NPAGE:
+                cur += rows
+            elif k == curses.KEY_HOME:
+                cur = 0
+            elif k == curses.KEY_END:
+                cur = len(items) - 1
+            elif k == ord(" "):
+                ping([items[cur]["tag"]])
+            elif k in (ord("a"), ord("A"), ord("ф"), ord("Ф")):
+                ping([it["tag"] for it in items[1:]])
+            elif k in (curses.KEY_ENTER, 10, 13):
+                return items[cur]["tag"]
+            elif k in (ord("q"), ord("Q"), ord("й"), ord("Й"), 27):
+                return None
+
+    os.environ.setdefault("ESCDELAY", "25")
+    try:
+        choice = curses.wrapper(ui)
+    except KeyboardInterrupt:
+        choice = None
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+        prober.close()
+    st["latency"].update({t: ms for t, ms in lat.items() if t != "auto"})
+    save_state(st)
+    if choice is None:
+        print("выбор не изменён")
+        return
+    cmd_use(st, argparse.Namespace(server=choice))
 
 
 def ip_snapshot():
@@ -1275,9 +1473,10 @@ def cmd_set(st, a):
         val = a.value
     s[a.key] = val
     save_state(st)
-    if a.key == "bypass_sports":
+    if a.key in ("bypass_sports", "before_units"):
         install_units(st)
-        print("  правила обхода применятся при следующем sbx restart")
+        if a.key == "bypass_sports":
+            print("  правила обхода применятся при следующем sbx restart")
     apply(st)
     print(f"{a.key} = {json.dumps(val, ensure_ascii=False)}")
 
@@ -1308,6 +1507,7 @@ def main():
     p = argparse.ArgumentParser(prog="sbx", description=__doc__.split("\n")[0],
                                 epilog=__doc__.split("\n\n", 1)[1],
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("-V", "--version", action="version", version=f"sbx {__version__}")
     sp = p.add_subparsers(dest="cmd", metavar="команда")
 
     s = sp.add_parser("sub", help="подписки: ls | add ИМЯ URL | rm ИМЯ")
@@ -1341,9 +1541,11 @@ def main():
     x.add_argument("filter", nargs="?")
     x.set_defaults(func=cmd_ls)
 
-    x = sp.add_parser("use", help="выбрать сервер: номер, часть имени или auto")
-    x.add_argument("server")
-    x.set_defaults(func=cmd_use)
+    x = sp.add_parser("use", help="выбрать сервер: номер, часть имени или auto; без аргумента — меню")
+    x.add_argument("server", nargs="?")
+    x.set_defaults(func=lambda st, a: cmd_use(st, a) if a.server else cmd_pick(st, a))
+    sp.add_parser("pick", help="интерактивный выбор сервера (↑↓, пробел — пинг, Enter)"
+                  ).set_defaults(func=cmd_pick)
 
     x = sp.add_parser("test", help="задержка до серверов")
     x.add_argument("filter", nargs="?")
